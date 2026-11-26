@@ -1,68 +1,97 @@
 # ToDo App
 
-Aplicação de lista de tarefas utilizada nos laboratórios de Engenharia de Software do professor Laércio. O objetivo do laboratório é trabalhar a implantação de uma aplicação em nuvem, partindo de um sistema já desenvolvido.
+Aplicação de lista de tarefas utilizada como base do projeto de infraestrutura em nuvem (Docker, Terraform, Ansible e CI/CD).
 
-A aplicação permite cadastrar, listar, concluir, reabrir e excluir tarefas. Ela foi trazida do repositório `aula-uniamerica-infraestrutura-cloud` como base para este novo laboratório.
+A aplicação permite cadastrar, listar, concluir, reabrir e excluir tarefas. Consulte também o [escopo em PDF](escopo.pdf) ou a [versão editável](docs/escopo.md) com os requisitos arquiteturais, operacionais e critérios de aceite.
 
-## Escopo para a Feira de Profissões
-
-O cenário da atividade apresenta o projeto desenvolvido por alunos do 3º período de Engenharia de Software e a contratação de um profissional para implantá-lo na nuvem para a feira.
-
-Consulte o [escopo em PDF](escopo.pdf) ou a [versão editável](docs/escopo.md), com arquitetura, automação, custos, entregáveis e critérios de aceite. O [fluxo proposto da aplicação](docs/assets/fluxo-aplicacao.pdf) também está disponível separadamente. Para gerar os PDFs, instale a dependência de documentação `reportlab` e execute `python scripts/render-escopo.py`.
+---
 
 ## Executar localmente
 
-Pré-requisitos: Git e Docker com Docker Compose. No Windows, execute o Docker Desktop com containers Linux antes de iniciar.
+Pré-requisitos: Git, Docker Engine e Docker Compose v2. No Windows, execute o Docker Desktop com containers Linux antes de iniciar.
 
-1. Abra um terminal na pasta deste repositório:
+1. Crie o arquivo `.env` a partir do modelo de exemplo (não versionado):
 
    ```bash
-   cd todo-app
+   cp .env.example .env
    ```
 
-2. Construa as imagens e inicie os serviços:
+2. Edite o `.env` definindo senhas locais para `MONGO_INITDB_ROOT_PASSWORD` e `MONGO_APP_PASSWORD` (por padrão, o ambiente local usa `FRONTEND_PORT=8080` para evitar conflito caso a porta `80` do host já esteja em uso).
+
+3. Construa as imagens e inicie os serviços:
 
    ```bash
    docker compose up --build -d
    ```
 
-3. Confira os serviços e acompanhe os logs:
+4. Confira o status (`healthy`) e acompanhe os logs:
 
    ```bash
    docker compose ps
    docker compose logs -f
    ```
 
-   Aguarde a mensagem `Conectado ao MongoDB` no backend. Use `Ctrl+C` para sair dos logs; os serviços continuam rodando.
+5. Acesse a aplicação em **http://localhost:8080**:
+   - **Interface React:** `http://localhost:8080/`
+   - **API (via proxy reverso Nginx):** `http://localhost:8080/todos`
+   - **Health check (API + MongoDB):** `http://localhost:8080/health`
 
-4. Acesse a aplicação em **http://localhost**. A API está em **http://localhost:5000/todos**.
-
-5. Cadastre uma tarefa, clique no texto para concluir ou reabrir e use **Excluir** para removê-la. Atualize a página para conferir os dados retornados pela API.
-
-6. Ao terminar, pare os serviços:
+6. Para parar os serviços preservando os dados no volume `mongo_data`:
 
    ```bash
    docker compose down
    ```
 
-As portas 80, 5000 e 27017 precisam estar disponíveis na máquina. Caso seu ambiente use o executável legado, substitua `docker compose` por `docker-compose`.
+---
 
-## Estrutura
-
-- `frontend/`: interface React, compilada e servida pelo Nginx.
-- `backend/`: API Node.js com Express e Mongoose.
-- `banco-de-dados/`: imagem MongoDB e script de criação dos dados iniciais.
-- `docker-compose.yaml`: execução dos três serviços na rede local `todo-net`.
-
-O navegador acessa o frontend e envia as operações para a API. A API consulta e atualiza o MongoDB.
+## Fluxo e Estrutura Atual
 
 ```text
-Navegador -> Frontend (porta 80)
-Navegador -> API Express (porta 5000) -> MongoDB (porta 27017)
+Navegador ──► Nginx (:8080 -> :80)
+                ├── /        ──► Frontend React (arquivos estáticos)
+                ├── /todos*  ──► Proxy reverso -> Backend Express (:5000)
+                └── /health  ──► Proxy reverso -> Backend Express (:5000/health)
+                                                     │
+                                      (rede interna todo-net :27017)
+                                                     ▼
+                                              MongoDB (volume mongo_data)
 ```
 
-## Base do laboratório de nuvem
+- `frontend/`: interface React compilada e servida pelo Nginx com template de proxy reverso (`frontend/nginx.conf.template`).
+- `backend/`: API Node.js com Express e Mongoose, configurada por variáveis de ambiente e endpoint `/health`.
+- `banco-de-dados/`: imagem MongoDB (`mongo:9.0.8`) e script `init-mongo.js` com criação de usuário dedicado e carga inicial.
+- `docker-compose.yaml`: orquestração local com volume nomeado `mongo_data`, health checks e isolamento das portas `5000` e `27017`.
+- `deploy/`: arquivos Compose separados para implantação em duas VMs na nuvem (`docker-compose.app.yml` e `docker-compose.db.yml`).
+- `.env.example`: modelo de variáveis de ambiente sem credenciais reais.
+- `DIAGNOSTICO.md`: levantamento inicial do repositório e lacunas para nuvem.
+- `TESTE-LOCAL.md`: registro dos testes locais executados antes e depois da adaptação.
 
-Esta importação mantém o código e a configuração de execução da aplicação original. O frontend utiliza `http://localhost:5000` para acessar a API, e a conexão do backend com o banco está definida em `backend/index.js`.
+---
 
-O Compose atual utiliza credenciais de demonstração e não configura um volume nomeado para o MongoDB. Endereços dos serviços, configuração por ambiente, persistência, isolamento do banco e automação da infraestrutura serão tratados no desenho do laboratório de nuvem.
+## Alterações Realizadas até a Fase 3
+
+### Fase 1 — Diagnóstico do Repositório
+- Mapeamento completo dos serviços, portas, imagens Docker, volumes, variáveis de ambiente, fluxo de rede e pontos de acoplamento para implantação em nuvem registrado em [DIAGNOSTICO.md](DIAGNOSTICO.md).
+
+### Fase 2 — Teste Local da Base Original
+- Validação inicial com Docker Compose identificando conflito local na porta `80`, perda de dados após `docker compose down && docker compose up -d` (ausência de volume persistente) e avisos de opções depreciadas. Resultados documentados em [TESTE-LOCAL.md](TESTE-LOCAL.md).
+
+### Fase 3 — Adaptação da Aplicação para Nuvem
+1. **Remoção de `localhost:5000` no Frontend ([frontend/src/App.js](frontend/src/App.js)):**
+   - Chamadas Axios passaram a usar `REACT_APP_API_URL` com fallback para caminho relativo `/todos`.
+2. **Proxy reverso no Nginx ([frontend/nginx.conf.template](frontend/nginx.conf.template) e [frontend/Dockerfile](frontend/Dockerfile)):**
+   - Encaminhamento de `/todos` e `/health` para o serviço `backend`, permitindo expor interface e API no mesmo endereço público.
+   - Imagens fixadas em `node:18.20.8-alpine` e `nginx:1.31.10-alpine`, build com `npm ci` e adição de `HEALTHCHECK`.
+3. **Parametrização e saúde do Backend ([backend/index.js](backend/index.js) e [backend/Dockerfile](backend/Dockerfile)):**
+   - Configuração de `PORT`, `MONGODB_URI` (ou `MONGO_HOST`, `MONGO_PORT`, `MONGO_DB`, `MONGO_USER`, `MONGO_PASSWORD`, `MONGO_AUTH_SOURCE`) e `CORS_ORIGIN` via variáveis de ambiente.
+   - Adição do endpoint `GET /health` verificando conexão e ping no MongoDB, além de reconexão automática (`connectWithRetry`).
+   - Remoção das opções depreciadas do Mongoose 8 (`useNewUrlParser`, `useUnifiedTopology`).
+   - Imagem fixada em `node:18.20.8-alpine`, `npm ci --omit=dev` e `HEALTHCHECK`.
+4. **Banco de Dados e Menor Privilégio ([banco-de-dados/Dockerfile](banco-de-dados/Dockerfile) e [banco-de-dados/init-mongo.js](banco-de-dados/init-mongo.js)):**
+   - Substituição de `mongo:latest` pela versão fixa `mongo:9.0.8` e adição de `HEALTHCHECK`.
+   - Criação idempotente do usuário dedicado da aplicação (`MONGO_APP_USER` / `MONGO_APP_PASSWORD`) com permissão `readWrite` apenas no banco `todo-app`.
+5. **Persistência, Isolamento e Preparação para 2 VMs ([docker-compose.yaml](docker-compose.yaml), [deploy/](deploy/)):**
+   - Inclusão do volume nomeado `mongo_data`, `restart: unless-stopped`, `depends_on` com `condition: service_healthy` e remoção da publicação pública das portas `5000` e `27017` no ambiente local.
+   - Separação da topologia de nuvem em `deploy/docker-compose.app.yml` (VM 1: frontend + backend) e `deploy/docker-compose.db.yml` (VM 2: MongoDB exclusivo vinculado ao IP privado).
+6. **Proteção de Segredos ([.env.example](.env.example) e [.gitignore](.gitignore)):**
+   - Criação do `.env.example` sem credenciais reais e ampliação do `.gitignore` para proteger `.env`, arquivos de estado/variáveis do Terraform, chaves SSH, segredos e inventário dinâmico do Ansible.

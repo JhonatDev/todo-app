@@ -1,10 +1,37 @@
+# Dependências e builds
 node_modules/
 build/
 coverage/
 data/
-.env
-.env.*
-!.env.example
 *.log
 .DS_Store
 Thumbs.db
+
+# Variáveis de ambiente e segredos
+.env
+.env.*
+!.env.example
+secrets/
+*.secret
+*vault_pass*
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+override.tf
+override.tf.json
+
+# Chaves SSH e certificados privados
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.ppk
+
+# Inventários Ansible gerados dinamicamente
+ansible/inventory/hosts.ini
