@@ -62,13 +62,15 @@ Navegador ──► Nginx (:8080 -> :80)
 - `banco-de-dados/`: imagem MongoDB (`mongo:9.0.8`) e script `init-mongo.js` com criação de usuário dedicado e carga inicial.
 - `docker-compose.yaml`: orquestração local com volume nomeado `mongo_data`, health checks e isolamento das portas `5000` e `27017`.
 - `deploy/`: arquivos Compose separados para implantação em duas VMs na nuvem (`docker-compose.app.yml` e `docker-compose.db.yml`).
+- `terraform/`: infraestrutura como código na AWS (VPC, sub-redes, Security Groups, 2 instâncias EC2, EBS persistente e outputs para o Ansible).
 - `.env.example`: modelo de variáveis de ambiente sem credenciais reais.
 - `DIAGNOSTICO.md`: levantamento inicial do repositório e lacunas para nuvem.
 - `TESTE-LOCAL.md`: registro dos testes locais executados antes e depois da adaptação.
+- `ARQUITETURA.md`: desenho da arquitetura na AWS (`sa-east-1`), firewall, HTTPS, backup/restauração e estimativa de custos.
 
 ---
 
-## Alterações Realizadas até a Fase 3
+## Alterações Realizadas até a Fase 5
 
 ### Fase 1 — Diagnóstico do Repositório
 - Mapeamento completo dos serviços, portas, imagens Docker, volumes, variáveis de ambiente, fluxo de rede e pontos de acoplamento para implantação em nuvem registrado em [DIAGNOSTICO.md](DIAGNOSTICO.md).
@@ -95,3 +97,9 @@ Navegador ──► Nginx (:8080 -> :80)
    - Separação da topologia de nuvem em `deploy/docker-compose.app.yml` (VM 1: frontend + backend) e `deploy/docker-compose.db.yml` (VM 2: MongoDB exclusivo vinculado ao IP privado).
 6. **Proteção de Segredos ([.env.example](.env.example) e [.gitignore](.gitignore)):**
    - Criação do `.env.example` sem credenciais reais e ampliação do `.gitignore` para proteger `.env`, arquivos de estado/variáveis do Terraform, chaves SSH, segredos e inventário dinâmico do Ansible.
+
+### Fase 4 — Desenho da Infraestrutura na AWS
+- Definição da topologia de duas VMs na região `sa-east-1` (`ARQUITETURA.md`), regras de Security Groups isolando o MongoDB na rede privada, estratégia de persistência (EBS `gp3`), backup/restauração, HTTPS com `sslip.io`/DuckDNS + Let's Encrypt e estimativa de custos em [ARQUITETURA.md](ARQUITETURA.md).
+
+### Fase 5 — Provisionamento com Terraform
+- Criação dos arquivos em [terraform/](terraform/) (`versions.tf`, `providers.tf`, `variables.tf`, `main.tf`, `outputs.tf`, `terraform.tfvars.example` e `README.md`) para provisionar VPC, sub-redes, Internet Gateway, Security Groups, duas EC2, volume EBS dedicado e outputs estruturados para o Ansible, validado localmente com `terraform fmt -check`, `terraform init` e `terraform validate`.
