@@ -11,26 +11,6 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
-data "aws_ami" "ubuntu" {
-  count       = var.os_image_ami == "" ? 1 : 0
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
-locals {
-  selected_ami = var.os_image_ami != "" ? var.os_image_ami : data.aws_ami.ubuntu[0].id
-}
-
 # --- Chave SSH ---
 
 resource "aws_key_pair" "deployer" {
@@ -79,7 +59,7 @@ resource "aws_subnet" "db" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = var.db_subnet_cidr
   availability_zone       = data.aws_availability_zones.available.names[0]
-  map_public_ip_on_launch = var.db_associate_public_ip
+  map_public_ip_on_launch = false
 
   tags = {
     Name = "${local.name_prefix}-subnet-db"
@@ -105,17 +85,53 @@ resource "aws_route_table_association" "app" {
   route_table_id = aws_route_table.public.id
 }
 
-resource "aws_route_table_association" "db" {
-  count          = var.db_associate_public_ip ? 1 : 0
-  subnet_id      = aws_subnet.db.id
-  route_table_id = aws_route_table.public.id
+resource "aws_eip" "app" {
+  domain = "vpc"
+
+  tags = { Name = "${local.name_prefix}-app" }
 }
+
+resource "aws_eip_association" "app" {
+  instance_id   = aws_instance.app.id
+  allocation_id = aws_eip.app.id
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = { Name = "${local.name_prefix}-nat" }
+}
+
+resource "aws_nat_gateway" "db" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.app.id
+  depends_on    = [aws_route_table_association.app]
+
+  tags = { Name = "${local.name_prefix}-nat" }
+}
+
+resource "aws_route_table" "db" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.db.id
+  }
+
+  tags = { Name = "${local.name_prefix}-rt-db" }
+}
+
+resource "aws_route_table_association" "db" {
+  subnet_id      = aws_subnet.db.id
+  route_table_id = aws_route_table.db.id
+}
+
 
 # --- Regras de Acesso (Security Groups) ---
 
 resource "aws_security_group" "app" {
   name        = "${local.name_prefix}-sg-app"
-  description = "Permite HTTP/HTTPS publicos e SSH administrativo para a VM da aplicacao"
+  description = "Permite HTTP e HTTPS publicos para a VM da aplicacao"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -134,14 +150,6 @@ resource "aws_security_group" "app" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    description = "SSH administrativo restrito"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.admin_cidr]
-  }
-
   egress {
     description = "Trafego de saida necessario para atualizacoes, Docker e conexao ao MongoDB"
     from_port   = 0
@@ -157,7 +165,7 @@ resource "aws_security_group" "app" {
 
 resource "aws_security_group" "db" {
   name        = "${local.name_prefix}-sg-db"
-  description = "Permite MongoDB (27017) exclusivamente da VM da aplicacao pela rede privada e SSH restrito"
+  description = "Permite MongoDB exclusivamente da VM da aplicacao pela rede privada"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -166,14 +174,6 @@ resource "aws_security_group" "db" {
     to_port         = 27017
     protocol        = "tcp"
     security_groups = [aws_security_group.app.id]
-  }
-
-  ingress {
-    description = "SSH administrativo restrito"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.admin_cidr]
   }
 
   egress {
@@ -192,14 +192,22 @@ resource "aws_security_group" "db" {
 # --- VM 1: Aplicação (Nginx + Frontend React + API Express) ---
 
 resource "aws_instance" "app" {
-  ami                         = local.selected_ami
+  ami                         = var.os_image_ami
   instance_type               = local.app_instance_type
   subnet_id                   = aws_subnet.app.id
   vpc_security_group_ids      = [aws_security_group.app.id]
   key_name                    = local.effective_key
-  associate_public_ip_address = true
+  associate_public_ip_address = false
+  iam_instance_profile        = aws_iam_instance_profile.ssm.name
+  user_data                   = file("${path.module}/ssm-agent.sh")
+  depends_on                  = [aws_iam_role_policy_attachment.ssm, aws_route_table_association.app]
+
+  metadata_options {
+    http_tokens = "required"
+  }
 
   root_block_device {
+    encrypted             = true
     volume_size           = var.root_volume_size
     volume_type           = "gp3"
     delete_on_termination = true
@@ -214,14 +222,22 @@ resource "aws_instance" "app" {
 # --- VM 2: Banco de Dados Exclusivo (MongoDB) ---
 
 resource "aws_instance" "db" {
-  ami                         = local.selected_ami
+  ami                         = var.os_image_ami
   instance_type               = local.db_instance_type
   subnet_id                   = aws_subnet.db.id
   vpc_security_group_ids      = [aws_security_group.db.id]
   key_name                    = local.effective_key
-  associate_public_ip_address = var.db_associate_public_ip
+  associate_public_ip_address = false
+  iam_instance_profile        = aws_iam_instance_profile.ssm.name
+  user_data                   = file("${path.module}/ssm-agent.sh")
+  depends_on                  = [aws_iam_role_policy_attachment.ssm, aws_route_table_association.db]
+
+  metadata_options {
+    http_tokens = "required"
+  }
 
   root_block_device {
+    encrypted             = true
     volume_size           = var.root_volume_size
     volume_type           = "gp3"
     delete_on_termination = true

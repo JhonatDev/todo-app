@@ -17,12 +17,13 @@ secrets/
 
 # Terraform
 .terraform/
-.terraform.lock.hcl
 terraform.tfstate
 terraform.tfstate.*
 *.tfvars
 *.tfvars.json
 crash.log
+*.tfplan
+__pycache__/
 override.tf
 override.tf.json
 

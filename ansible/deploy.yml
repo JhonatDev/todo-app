@@ -1,0 +1,174 @@
+---
+- name: Preparar as VMs
+  hosts: all
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Aguardar a administração via SSM
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Coletar informações do host
+      ansible.builtin.setup:
+
+    - name: Aplicar atualizações do Ubuntu quando solicitado
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 180
+      when: update_os | bool
+
+    - name: Verificar se o Ubuntu precisa reiniciar
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: os_reboot
+      when: update_os | bool
+
+    - name: Reiniciar após a atualização quando necessário
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+      when: update_os | bool and os_reboot.stat.exists
+
+    - name: Instalar Docker, Compose e pacotes solicitados
+      ansible.builtin.apt:
+        name: "{{ ['ca-certificates', 'curl', 'docker.io', 'docker-compose-v2'] + extra_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 180
+
+    - name: Habilitar o Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+- name: Preparar o disco persistente do MongoDB
+  hosts: database
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    mongo_device: "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_{{ db_volume_id | replace('-', '') }}"
+  tasks:
+    - name: Aguardar o volume EBS dedicado
+      ansible.builtin.wait_for:
+        path: "{{ mongo_device }}"
+        timeout: 180
+
+    - name: Ler as assinaturas do volume dedicado
+      ansible.builtin.command:
+        argv: [wipefs, --noheadings, --output, TYPE, "{{ mongo_device }}"]
+      register: volume_signatures
+      changed_when: false
+
+    - name: Confirmar que o volume está vazio ou já usa ext4
+      ansible.builtin.assert:
+        that:
+          - (volume_signatures.stdout_lines | map('trim') | difference(['ext4'])) | length == 0
+
+    - name: Criar o sistema de arquivos usando apenas o volume dedicado
+      community.general.filesystem:
+        dev: "{{ mongo_device }}"
+        fstype: ext4
+      when: volume_signatures.stdout | trim == ''
+
+    - name: Identificar o UUID do volume
+      ansible.builtin.command:
+        argv: [blkid, -s, UUID, -o, value, "{{ mongo_device }}"]
+      register: mongo_uuid
+      changed_when: false
+
+    - name: Montar e registrar o volume no fstab
+      ansible.posix.mount:
+        path: /mnt/todo-mongo
+        src: "UUID={{ mongo_uuid.stdout }}"
+        fstype: ext4
+        opts: defaults
+        passno: "2"
+        state: mounted
+
+    - name: Criar o diretório de dados dentro do disco montado
+      ansible.builtin.file:
+        path: /mnt/todo-mongo/data
+        state: directory
+        mode: "0755"
+
+    - name: Criar diretório de configuração do Docker para o banco
+      ansible.builtin.file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Fazer o Docker depender do volume montado no host do banco
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/docker.service.d/mongo-mount.conf
+        mode: "0644"
+        content: |
+          [Unit]
+          RequiresMountsFor=/mnt/todo-mongo
+      register: docker_mount_dependency
+
+    - name: Recarregar as unidades do systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: docker_mount_dependency.changed
+
+- name: Publicar o MongoDB
+  hosts: database
+  gather_facts: false
+  any_errors_fatal: true
+  become: true
+  vars:
+    compose_kind: db
+    compose_dir: /opt/todo-app
+  tasks:
+    - name: Aplicar o Compose do MongoDB
+      ansible.builtin.import_tasks: tasks/compose.yml
+
+- name: Publicar frontend e API
+  hosts: application
+  gather_facts: false
+  any_errors_fatal: true
+  become: true
+  vars:
+    compose_kind: app
+    compose_dir: /opt/todo-app
+  tasks:
+    - name: Aplicar o Compose da aplicação
+      ansible.builtin.import_tasks: tasks/compose.yml
+
+- name: Publicar o endereço HTTPS
+  hosts: application
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Instalar o proxy HTTPS
+      ansible.builtin.apt:
+        name: caddy
+        state: present
+        lock_timeout: 180
+
+    - name: Configurar HTTPS e proxy para o frontend local
+      ansible.builtin.copy:
+        dest: /etc/caddy/Caddyfile
+        mode: "0644"
+        validate: caddy validate --adapter caddyfile --config %s
+        content: |
+          {
+            acme_ca https://acme-v02.api.letsencrypt.org/directory
+          }
+
+          {{ app_domain }} {
+            reverse_proxy 127.0.0.1:8080
+          }
+      register: caddy_config
+
+    - name: Habilitar o proxy HTTPS
+      ansible.builtin.systemd_service:
+        name: caddy
+        enabled: true
+        state: "{{ 'reloaded' if caddy_config.changed else 'started' }}"

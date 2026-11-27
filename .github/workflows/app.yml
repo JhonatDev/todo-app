@@ -1,0 +1,80 @@
+name: Aplicação
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: Ambiente a implantar após publicar (none só publica)
+        type: choice
+        options: [none, dev, homolog, prod]
+        default: none
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validar as imagens e o fluxo de tarefas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      release_tag: ${{ steps.publish.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construir e verificar o ambiente local
+        shell: bash
+        run: |
+          docker compose --env-file .env.example up --build -d --wait --wait-timeout 180
+          python3 scripts/smoke.py http://127.0.0.1:8080
+          python3 scripts/local-persistence.py
+
+      - name: Consultar logs se a validação falhar
+        if: failure()
+        run: docker compose --env-file .env.example logs --no-color --tail 40
+
+      - name: Publicar a versão por commit no GHCR
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+        id: publish
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          registry="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="sha-$GITHUB_SHA"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          for service in backend frontend mongo; do
+            image="$registry/todo-app-$service:$tag"
+            if docker manifest inspect "$image" >/dev/null 2>&1; then
+              echo "Versão existente: $image"
+            else
+              docker tag "todo-app-$service:1.0.0" "$image"
+              docker push "$image"
+            fi
+          done
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Versão publicada: $tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remover o ambiente temporário
+        if: always()
+        run: docker compose --env-file .env.example down -v
+
+  deploy:
+    name: Implantar a versão publicada
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_environment != 'none'
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    uses: ./.github/workflows/infra.yml
+    with:
+      environment: ${{ inputs.deploy_environment }}
+      release_tag: ${{ needs.validate.outputs.release_tag }}
+    secrets: inherit
