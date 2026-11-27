@@ -70,36 +70,10 @@ Navegador ──► Nginx (:8080 -> :80)
 
 ---
 
-## Alterações Realizadas até a Fase 5
+## Entrega PM-04 na AWS
 
-### Fase 1 — Diagnóstico do Repositório
-- Mapeamento completo dos serviços, portas, imagens Docker, volumes, variáveis de ambiente, fluxo de rede e pontos de acoplamento para implantação em nuvem registrado em [DIAGNOSTICO.md](DIAGNOSTICO.md).
-
-### Fase 2 — Teste Local da Base Original
-- Validação inicial com Docker Compose identificando conflito local na porta `80`, perda de dados após `docker compose down && docker compose up -d` (ausência de volume persistente) e avisos de opções depreciadas. Resultados documentados em [TESTE-LOCAL.md](TESTE-LOCAL.md).
-
-### Fase 3 — Adaptação da Aplicação para Nuvem
-1. **Remoção de `localhost:5000` no Frontend ([frontend/src/App.js](frontend/src/App.js)):**
-   - Chamadas Axios passaram a usar `REACT_APP_API_URL` com fallback para caminho relativo `/todos`.
-2. **Proxy reverso no Nginx ([frontend/nginx.conf.template](frontend/nginx.conf.template) e [frontend/Dockerfile](frontend/Dockerfile)):**
-   - Encaminhamento de `/todos` e `/health` para o serviço `backend`, permitindo expor interface e API no mesmo endereço público.
-   - Imagens fixadas em `node:18.20.8-alpine` e `nginx:1.31.10-alpine`, build com `npm ci` e adição de `HEALTHCHECK`.
-3. **Parametrização e saúde do Backend ([backend/index.js](backend/index.js) e [backend/Dockerfile](backend/Dockerfile)):**
-   - Configuração de `PORT`, `MONGODB_URI` (ou `MONGO_HOST`, `MONGO_PORT`, `MONGO_DB`, `MONGO_USER`, `MONGO_PASSWORD`, `MONGO_AUTH_SOURCE`) e `CORS_ORIGIN` via variáveis de ambiente.
-   - Adição do endpoint `GET /health` verificando conexão e ping no MongoDB, além de reconexão automática (`connectWithRetry`).
-   - Remoção das opções depreciadas do Mongoose 8 (`useNewUrlParser`, `useUnifiedTopology`).
-   - Imagem fixada em `node:18.20.8-alpine`, `npm ci --omit=dev` e `HEALTHCHECK`.
-4. **Banco de Dados e Menor Privilégio ([banco-de-dados/Dockerfile](banco-de-dados/Dockerfile) e [banco-de-dados/init-mongo.js](banco-de-dados/init-mongo.js)):**
-   - Substituição de `mongo:latest` pela versão fixa `mongo:9.0.8` e adição de `HEALTHCHECK`.
-   - Criação idempotente do usuário dedicado da aplicação (`MONGO_APP_USER` / `MONGO_APP_PASSWORD`) com permissão `readWrite` apenas no banco `todo-app`.
-5. **Persistência, Isolamento e Preparação para 2 VMs ([docker-compose.yaml](docker-compose.yaml), [deploy/](deploy/)):**
-   - Inclusão do volume nomeado `mongo_data`, `restart: unless-stopped`, `depends_on` com `condition: service_healthy` e remoção da publicação pública das portas `5000` e `27017` no ambiente local.
-   - Separação da topologia de nuvem em `deploy/docker-compose.app.yml` (VM 1: frontend + backend) e `deploy/docker-compose.db.yml` (VM 2: MongoDB exclusivo vinculado ao IP privado).
-6. **Proteção de Segredos ([.env.example](.env.example) e [.gitignore](.gitignore)):**
-   - Criação do `.env.example` sem credenciais reais e ampliação do `.gitignore` para proteger `.env`, arquivos de estado/variáveis do Terraform, chaves SSH, segredos e inventário dinâmico do Ansible.
-
-### Fase 4 — Desenho da Infraestrutura na AWS
-- Definição da topologia de duas VMs na região `sa-east-1` (`ARQUITETURA.md`), regras de Security Groups isolando o MongoDB na rede privada, estratégia de persistência (EBS `gp3`), backup/restauração, HTTPS com `sslip.io`/DuckDNS + Let's Encrypt e estimativa de custos em [ARQUITETURA.md](ARQUITETURA.md).
-
-### Fase 5 — Provisionamento com Terraform
-- Criação dos arquivos em [terraform/](terraform/) (`versions.tf`, `providers.tf`, `variables.tf`, `main.tf`, `outputs.tf`, `terraform.tfvars.example` e `README.md`) para provisionar VPC, sub-redes, Internet Gateway, Security Groups, duas EC2, volume EBS dedicado e outputs estruturados para o Ansible, validado localmente com `terraform fmt -check`, `terraform init` e `terraform validate`.
+- [Arquitetura, decisões e estimativa](ARQUITETURA.md)
+- [Manual de preparação, pipeline, operação e evidências](docs/operacao-pm04.md)
+- [Terraform e estado da infraestrutura](terraform/README.md)
+- [Ansible para configuração e manutenção](ansible/deploy.yml)
+- [Workflow de infraestrutura](.github/workflows/infra.yml) e [workflow de aplicação](.github/workflows/app.yml)

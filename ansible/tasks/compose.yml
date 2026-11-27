@@ -1,0 +1,62 @@
+---
+- name: Preparar o diretório de deploy
+  ansible.builtin.file:
+    path: "{{ compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Instalar o arquivo Compose
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../deploy/docker-compose.{{ compose_kind }}.yml"
+    dest: "{{ compose_dir }}/compose.yml"
+    mode: "0600"
+
+- name: Configurar o deploy e as credenciais do banco
+  ansible.builtin.template:
+    src: "compose-{{ compose_kind }}.env.j2"
+    dest: "{{ compose_dir }}/.env"
+    mode: "0600"
+  no_log: true
+
+- name: Autenticar temporariamente no GHCR, publicar e verificar contêineres
+  block:
+    - name: Autenticar no registro de imagens
+      community.docker.docker_login:
+        registry_url: ghcr.io
+        username: "{{ lookup('ansible.builtin.env', 'GITHUB_ACTOR') }}"
+        password: "{{ lookup('ansible.builtin.env', 'GHCR_TOKEN') }}"
+      no_log: true
+      changed_when: false
+
+    - name: Aplicar a versão declarada e aguardar os healthchecks
+      community.docker.docker_compose_v2:
+        project_src: "{{ compose_dir }}"
+        build: never
+        pull: missing
+        state: present
+        wait: true
+        wait_timeout: 180
+      no_log: true
+
+  rescue:
+    - name: Verificar o estado dos serviços após uma falha
+      ansible.builtin.command:
+        argv: [docker, compose, ps, --all]
+        chdir: "{{ compose_dir }}"
+      register: deploy_status
+      changed_when: false
+      failed_when: false
+
+    - name: Interromper deploy com o estado dos serviços
+      ansible.builtin.fail:
+        msg: "Falha ao publicar {{ compose_kind }} na versão {{ release_tag }}. Estado: {{ deploy_status.stdout | default('indisponível', true) }}"
+
+  always:
+    - name: Remover a credencial temporária do GHCR
+      community.docker.docker_login:
+        registry_url: ghcr.io
+        state: absent
+      no_log: true
+      changed_when: false

@@ -1,0 +1,41 @@
+---
+- name: Operar e verificar os contêineres
+  hosts: "{{ 'all' if operation == 'diagnose' else service_target }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Reiniciar contêineres do host selecionado
+      community.docker.docker_compose_v2:
+        project_src: /opt/todo-app
+        state: restarted
+      when: operation == 'restart'
+      no_log: true
+
+    - name: Consultar estado e versões dos contêineres
+      ansible.builtin.command:
+        argv: [docker, compose, ps, --all]
+        chdir: /opt/todo-app
+      register: service_status
+      changed_when: false
+
+    - name: Exibir estado e versões, com endereço opcional de diagnóstico
+      ansible.builtin.debug:
+        var: service_status.stdout_lines
+
+    - name: Ler os últimos logs dos serviços
+      ansible.builtin.command:
+        argv: [docker, compose, logs, --no-color, --tail, "20"]
+        chdir: /opt/todo-app
+      register: service_logs
+      changed_when: false
+      when: operation == 'diagnose'
+      no_log: true
+
+    - name: Exibir logs com possíveis credenciais e URIs removidas
+      ansible.builtin.debug:
+        msg: >-
+          {{ service_logs.stdout
+             | replace(lookup('ansible.builtin.env', 'MONGO_ROOT_PASSWORD') | default('[segredo vazio]', true), '[oculto]')
+             | replace(lookup('ansible.builtin.env', 'MONGO_APP_PASSWORD') | default('[segredo vazio]', true), '[oculto]')
+             | regex_replace('mongodb(\\+srv)?://[^\\s"]+', '[URI oculta]') }}
+      when: operation == 'diagnose'

@@ -3,8 +3,6 @@
 services:
   mongo:
     image: ${DOCKER_REGISTRY:-ghcr.io/seu-usuario}/todo-app-mongo:${DOCKER_TAG:-1.0.0}
-    build:
-      context: ../banco-de-dados
     container_name: mongo-todo
     restart: unless-stopped
     ports:
@@ -16,14 +14,14 @@ services:
       MONGO_APP_USER: ${MONGO_APP_USER:?Defina MONGO_APP_USER no ambiente}
       MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?Defina MONGO_APP_PASSWORD no ambiente}
     volumes:
-      - mongo_data:/data/db
+      - type: bind
+        source: ${MONGO_DATA_PATH:-/mnt/todo-mongo/data}
+        target: /data/db
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
-
-volumes:
-  mongo_data:
-

@@ -52,9 +52,13 @@ variable "db_instance_type" {
 }
 
 variable "os_image_ami" {
-  description = "ID específico de AMI (opcional; se vazio, busca Ubuntu 24.04 LTS automaticamente)"
+  description = "ID fixo da AMI oficial Ubuntu 24.04 LTS amd64 na região"
   type        = string
-  default     = ""
+
+  validation {
+    condition     = can(regex("^ami-[0-9a-f]{17}$", var.os_image_ami))
+    error_message = "Informe o ID da AMI Ubuntu da região, no formato ami- seguido por 17 dígitos hexadecimais."
+  }
 }
 
 variable "ssh_user" {
@@ -96,17 +100,6 @@ variable "db_subnet_cidr" {
   description = "Bloco CIDR da sub-rede da VM do banco de dados"
   type        = string
   default     = "10.0.2.0/24"
-}
-
-variable "db_associate_public_ip" {
-  description = "Atribui IP público administrativo à VM do banco para SSH/Ansible sem NAT Gateway (porta 27017 nunca é aberta na internet)"
-  type        = bool
-  default     = true
-}
-
-variable "admin_cidr" {
-  description = "CIDR de origem permitido para acesso SSH administrativo (ex.: 203.0.113.10/32)"
-  type        = string
 }
 
 variable "ssh_key_name" {

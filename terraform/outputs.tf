@@ -1,6 +1,6 @@
 output "app_public_ip" {
   description = "IP público da VM da aplicação"
-  value       = aws_instance.app.public_ip
+  value       = aws_eip.app.public_ip
 }
 
 output "app_private_ip" {
@@ -13,19 +13,14 @@ output "db_private_ip" {
   value       = aws_instance.db.private_ip
 }
 
-output "db_public_ip" {
-  description = "IP público administrativo da VM do banco (se habilitado; porta 27017 bloqueada)"
-  value       = aws_instance.db.public_ip
-}
-
 output "suggested_https_domain" {
   description = "Subdomínio dinâmico gratuito (sslip.io) apontando para o IP público da aplicação"
-  value       = "${replace(aws_instance.app.public_ip, ".", "-")}.sslip.io"
+  value       = "${replace(aws_eip.app.public_ip, ".", "-")}.sslip.io"
 }
 
 output "app_url_https" {
   description = "URL HTTPS sugerida após configuração do certificado Let's Encrypt"
-  value       = "https://${replace(aws_instance.app.public_ip, ".", "-")}.sslip.io"
+  value       = "https://${replace(aws_eip.app.public_ip, ".", "-")}.sslip.io"
 }
 
 output "resource_names" {
@@ -41,7 +36,7 @@ output "resource_names" {
     db_instance_id        = aws_instance.db.id
     db_instance_name      = aws_instance.db.tags["Name"]
     db_volume_id          = aws_ebs_volume.mongo_data.id
-    ami_id                = local.selected_ami
+    ami_id                = var.os_image_ami
   }
 }
 
@@ -49,11 +44,11 @@ output "ansible_inventory_data" {
   description = "Dados estruturados para geração automática do inventário do Ansible"
   value = {
     ssh_user       = var.ssh_user
-    app_host       = aws_instance.app.public_ip
+    app_host       = aws_instance.app.id
     app_private_ip = aws_instance.app.private_ip
-    db_host        = var.db_associate_public_ip ? aws_instance.db.public_ip : aws_instance.db.private_ip
+    db_host        = aws_instance.db.id
     db_private_ip  = aws_instance.db.private_ip
-    db_device      = "/dev/sdf"
+    db_volume_id   = aws_ebs_volume.mongo_data.id
   }
 }
 

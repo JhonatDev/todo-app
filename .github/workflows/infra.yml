@@ -1,0 +1,300 @@
+name: Infraestrutura e operação
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Ambiente de destino
+        type: choice
+        options: [dev, homolog, prod]
+        default: dev
+      operation:
+        description: Operação
+        type: choice
+        options: [plan, deploy, diagnose, restart, backup, restore-test, reset-list, destroy]
+        default: plan
+      release_tag:
+        description: Tag sha-... publicada por Aplicação (obrigatória no deploy)
+        type: string
+      instance_name:
+        description: Nome base das VMs (vazio usa o padrão do ambiente)
+        type: string
+      instance_type:
+        description: Tipo das duas EC2 (vazio usa o padrão do ambiente)
+        type: string
+      update_os:
+        description: Verificar e aplicar atualizações de SO
+        type: boolean
+        default: false
+      extra_packages:
+        description: Pacotes Ubuntu separados por vírgula (vazio usa o padrão do ambiente)
+        type: string
+      service_target:
+        description: VM a reiniciar
+        type: choice
+        options: [application, database]
+        default: application
+      backup_name:
+        description: Nome do backup para restore-test (vazio usa o mais recente)
+        type: string
+      confirm:
+        description: Digite reset-list, destroy ou destroy-sem-backup para confirmar a operação correspondente
+        type: string
+
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+
+  schedule:
+    - cron: "35 6 * * *"
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+
+concurrency:
+  group: pm04-${{ inputs.environment || vars.TODO_BACKUP_ENVIRONMENT || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  operate:
+    if: github.event_name != 'schedule' || vars.TODO_BACKUP_ENVIRONMENT != ''
+    name: ${{ inputs.operation || (github.event_name == 'schedule' && 'backup' || 'deploy') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: ${{ inputs.environment || vars.TODO_BACKUP_ENVIRONMENT || 'dev' }}
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment || vars.TODO_BACKUP_ENVIRONMENT || 'dev' }}
+      OPERATION: ${{ inputs.operation || (github.event_name == 'schedule' && 'backup' || 'deploy') }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      INSTANCE_NAME: ${{ inputs.instance_name || vars.INSTANCE_NAME }}
+      EXTRA_PACKAGES: ${{ inputs.extra_packages || vars.EXTRA_PACKAGES }}
+      UPDATE_OS: ${{ inputs.update_os || false }}
+      SERVICE_TARGET: ${{ inputs.service_target || 'application' }}
+      BACKUP_NAME: ${{ inputs.backup_name }}
+      CONFIRM: ${{ inputs.confirm }}
+      STATE_BUCKET: ${{ vars.STATE_BUCKET }}
+      BACKUP_BUCKET: ${{ vars.BACKUP_BUCKET }}
+      APP_DOMAIN: ${{ vars.APP_DOMAIN }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'sa-east-1' }}
+      TF_INPUT: "false"
+      TF_IN_AUTOMATION: "true"
+      TF_VAR_instance_type: ${{ inputs.instance_type || vars.INSTANCE_TYPE || 't3.micro' }}
+      TF_VAR_os_image_ami: ${{ vars.UBUNTU_AMI_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validar parâmetros de execução
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${STATE_BUCKET:?Configure STATE_BUCKET no ambiente do GitHub}"
+          : "${BACKUP_BUCKET:?Configure BACKUP_BUCKET no ambiente do GitHub}"
+          [[ "$DEPLOY_ENVIRONMENT" =~ ^(dev|homolog|prod)$ ]]
+          [[ "$OPERATION" =~ ^(plan|deploy|diagnose|restart|backup|restore-test|reset-list|destroy)$ ]]
+          [[ -z "$APP_DOMAIN" || "$APP_DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]]
+          if [[ "$OPERATION" == deploy ]]; then
+            [[ "$RELEASE_TAG" =~ ^sha-[0-9a-f]{40}$ ]] || { echo 'Informe a tag sha-... publicada pelo workflow Aplicação.'; exit 1; }
+          fi
+          if [[ "$OPERATION" == reset-list && "$CONFIRM" != reset-list ]]; then
+            echo 'Confirme com reset-list para limpar a lista compartilhada.'; exit 1
+          fi
+          if [[ "$OPERATION" == destroy && "$CONFIRM" != destroy && "$CONFIRM" != destroy-sem-backup ]]; then
+            echo 'Confirme com destroy. Use destroy-sem-backup apenas se a aplicação ainda não tem dados ou se já estiverem salvos.'; exit 1
+          fi
+          if [[ -n "$INSTANCE_NAME" ]]; then
+            [[ "$INSTANCE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,53}$ ]] || {
+              echo 'Nome das VMs inválido.'; exit 1
+            }
+            echo "TF_VAR_app_vm_name=$INSTANCE_NAME-app" >> "$GITHUB_ENV"
+            echo "TF_VAR_db_vm_name=$INSTANCE_NAME-db" >> "$GITHUB_ENV"
+          fi
+          echo "TF_VAR_region=$AWS_REGION" >> "$GITHUB_ENV"
+          echo "TF_VAR_environment=$DEPLOY_ENVIRONMENT" >> "$GITHUB_ENV"
+
+      - name: Validar segredos, pacotes e existência das imagens
+        if: env.OPERATION == 'deploy'
+        env:
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+          MONGO_APP_PASSWORD: ${{ secrets.MONGO_APP_PASSWORD }}
+          GHCR_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          for name in ("MONGO_ROOT_PASSWORD", "MONGO_APP_PASSWORD"):
+              if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", os.environ.get(name, "")):
+                  raise SystemExit(f"Configure {name} com pelo menos 20 caracteres ASCII alfanuméricos, '_' ou '-'.")
+          if os.environ["MONGO_ROOT_PASSWORD"] == os.environ["MONGO_APP_PASSWORD"]:
+              raise SystemExit("Use duas senhas MongoDB diferentes.")
+          packages = [item.strip() for item in os.environ["EXTRA_PACKAGES"].split(",") if item.strip()]
+          if any(not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", package) for package in packages):
+              raise SystemExit("Informe nomes de pacotes válidos separados por vírgula.")
+          settings = {
+              "update_os": os.environ["UPDATE_OS"] == "true",
+              "extra_packages": packages,
+              "docker_registry": f"ghcr.io/{os.environ['GITHUB_REPOSITORY'].lower()}",
+              "release_tag": os.environ["RELEASE_TAG"],
+          }
+          pathlib.Path(os.environ["RUNNER_TEMP"], "deploy.json").write_text(json.dumps(settings))
+          PY
+          export DOCKER_CONFIG
+          DOCKER_CONFIG=$(mktemp -d)
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rmdir "$DOCKER_CONFIG" 2>/dev/null || true' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          registry="ghcr.io/${GITHUB_REPOSITORY,,}"
+          for service in backend frontend mongo; do
+            docker manifest inspect "$registry/todo-app-$service:$RELEASE_TAG" >/dev/null
+          done
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+
+      - name: Inicializar o estado remoto e validar Terraform
+        working-directory: terraform
+        shell: bash
+        run: |
+          terraform fmt -check
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="key=pm04/$DEPLOY_ENVIRONMENT/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION"
+          terraform validate
+
+      - name: Usar a chave do ambiente e derivar sua parte pública
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SSH_PRIVATE_KEY:?Configure SSH_PRIVATE_KEY no ambiente do GitHub}"
+          install -d -m 700 "$HOME/.ssh"
+          key="$HOME/.ssh/pm04"
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$key"
+          chmod 600 "$key"
+          echo "TF_VAR_ssh_public_key=$(ssh-keygen -y -f "$key")" >> "$GITHUB_ENV"
+          cat >> "$HOME/.ssh/config" <<'SSH'
+          Host i-*
+            IdentityFile ~/.ssh/pm04
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+            ProxyCommand aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p
+          SSH
+
+      - name: Planejar criação ou atualização
+        if: env.OPERATION == 'plan' || env.OPERATION == 'deploy'
+        working-directory: terraform
+        shell: bash
+        run: terraform plan -lock-timeout=120s -out="$RUNNER_TEMP/pm04.tfplan"
+
+      - name: Aplicar o plano do Terraform
+        if: env.OPERATION == 'deploy'
+        working-directory: terraform
+        shell: bash
+        run: terraform apply -lock-timeout=120s "$RUNNER_TEMP/pm04.tfplan"
+
+      - name: Obter inventário do ambiente
+        if: env.OPERATION != 'plan' && (env.OPERATION != 'destroy' || env.CONFIRM == 'destroy')
+        shell: bash
+        run: |
+          terraform -chdir=terraform output -json | python3 scripts/inventory.py "$RUNNER_TEMP/inventory.json"
+          terraform -chdir=terraform output -json resource_names
+
+      - name: Instalar o Session Manager Plugin
+        if: env.OPERATION != 'plan' && (env.OPERATION != 'destroy' || env.CONFIRM == 'destroy')
+        shell: bash
+        run: |
+          if ! command -v session-manager-plugin >/dev/null; then
+            curl --fail --silent --show-error \
+              https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb \
+              -o "$RUNNER_TEMP/session-manager-plugin.deb"
+            sudo dpkg -i "$RUNNER_TEMP/session-manager-plugin.deb"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: env.OPERATION == 'deploy' || env.OPERATION == 'diagnose' || env.OPERATION == 'restart'
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Ansible
+        if: env.OPERATION == 'deploy' || env.OPERATION == 'diagnose' || env.OPERATION == 'restart'
+        shell: bash
+        run: |
+          python -m pip install -r ansible/requirements.txt
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: Configurar e publicar a versão com Ansible
+        if: env.OPERATION == 'deploy'
+        env:
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+          MONGO_APP_PASSWORD: ${{ secrets.MONGO_APP_PASSWORD }}
+          GHCR_TOKEN: ${{ github.token }}
+        working-directory: ansible
+        shell: bash
+        run: |
+          ansible-playbook -i "$RUNNER_TEMP/inventory.json" deploy.yml -e "@$RUNNER_TEMP/deploy.json"
+
+      - name: Reiniciar ou consultar estado e logs
+        if: env.OPERATION == 'diagnose' || env.OPERATION == 'restart'
+        env:
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+          MONGO_APP_PASSWORD: ${{ secrets.MONGO_APP_PASSWORD }}
+        working-directory: ansible
+        shell: bash
+        run: |
+          ansible-playbook -i "$RUNNER_TEMP/inventory.json" operate.yml \
+            -e "operation=$OPERATION service_target=$SERVICE_TARGET"
+
+      - name: Verificar HTTPS, aplicação e isolamento
+        if: env.OPERATION == 'deploy' || env.OPERATION == 'restart' || env.OPERATION == 'diagnose'
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --retry 18 --retry-all-errors --retry-delay 5 \
+            --max-time 10 "$APP_URL/health"
+          if [[ "$OPERATION" == deploy ]]; then
+            python3 scripts/smoke.py "$APP_URL"
+            test "$(aws ec2 describe-instances --instance-ids "${DB_TARGET#*@}" \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)" = None
+            if timeout 5 bash -c 'echo > /dev/tcp/"$APP_PUBLIC_IP"/27017' 2>/dev/null; then
+              echo 'A porta do MongoDB respondeu no endpoint público.' >&2; exit 1
+            fi
+            echo 'Banco sem IPv4 público. A porta 27017 não responde no endpoint público.'
+          fi
+          echo "Aplicação disponível em $APP_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Backup automático antes de limpar dados ou desativar
+        if: env.OPERATION == 'reset-list' || (env.OPERATION == 'destroy' && env.CONFIRM == 'destroy')
+        shell: bash
+        run: bash scripts/mongo-ops.sh backup
+
+      - name: Fazer backup, testar restauração ou limpar tarefas
+        if: env.OPERATION == 'backup' || env.OPERATION == 'restore-test' || env.OPERATION == 'reset-list'
+        shell: bash
+        run: bash scripts/mongo-ops.sh "$OPERATION"
+
+      - name: Planejar e desativar o ambiente
+        if: env.OPERATION == 'destroy'
+        working-directory: terraform
+        shell: bash
+        run: |
+          terraform plan -destroy -lock-timeout=120s -out="$RUNNER_TEMP/destroy.tfplan"
+          terraform apply -lock-timeout=120s "$RUNNER_TEMP/destroy.tfplan"
