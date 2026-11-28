@@ -202,6 +202,11 @@ resource "aws_instance" "app" {
   user_data                   = file("${path.module}/ssm-agent.sh")
   depends_on                  = [aws_iam_role_policy_attachment.ssm, aws_route_table_association.app]
 
+  lifecycle {
+    # A associação separada do Elastic IP faz o provider reportar este atributo como true.
+    ignore_changes = [associate_public_ip_address]
+  }
+
   metadata_options {
     http_tokens = "required"
   }
