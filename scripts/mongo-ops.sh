@@ -2,11 +2,21 @@
 set -euo pipefail
 
 operation=${1:?Informe a operação}
-target=${DB_TARGET:?Inventário da VM do banco ausente}
+if [[ "$operation" != restore-test ]]; then
+  target=${DB_TARGET:?Inventário da VM do banco ausente}
+fi
 bucket=${BACKUP_BUCKET:?Bucket de backup ausente}
 prefix=${DEPLOY_ENVIRONMENT:?Ambiente ausente}
 workdir=$(mktemp -d)
-trap 'rm -f -- "$workdir/backup.archive.gz"; rmdir -- "$workdir"' EXIT
+restore_container=''
+cleanup() {
+  if [[ -n "$restore_container" ]]; then
+    docker rm -fv "$restore_container" >/dev/null 2>&1 || true
+  fi
+  rm -f -- "$workdir/backup.archive.gz"
+  rmdir -- "$workdir"
+}
+trap cleanup EXIT
 
 case "$operation" in
   backup)
@@ -33,32 +43,24 @@ case "$operation" in
     aws s3 cp "s3://$bucket/$prefix/$name" "$workdir/backup.archive.gz" --only-show-errors
     gzip -t "$workdir/backup.archive.gz"
 
-    # O container temporário não publica portas e não usa a rede ou o volume da aplicação.
-    ssh -T "$target" "$(cat <<'REMOTE'
-set -eu
-temp_name=todo-restore-test
-image=$(sudo docker inspect --format '{{.Image}}' mongo-todo)
-if sudo docker container inspect "$temp_name" >/dev/null 2>&1; then
-  sudo docker rm -fv "$temp_name" >/dev/null
-fi
-sudo docker run -d --network none --name "$temp_name" \
-  --entrypoint mongod "$image" --bind_ip 127.0.0.1 >/dev/null
-trap 'sudo docker rm -fv "$temp_name" >/dev/null' EXIT
-for attempt in $(seq 1 30); do
-  if sudo docker exec "$temp_name" mongosh --quiet --eval 'quit(db.adminCommand({ping:1}).ok === 1 ? 0 : 1)' >/dev/null 2>&1; then
-    break
-  fi
-  sleep 2
-done
-sudo docker exec -i "$temp_name" mongorestore --archive --gzip --stopOnError
-sudo docker exec "$temp_name" mongosh --quiet --eval '
-  const todos = db.getSiblingDB("todo-app").todos;
-  const result = todos.validate();
-  if (!result.valid) quit(1);
-  print("Documentos recuperados: " + todos.countDocuments({}));
-'
-REMOTE
-)" < "$workdir/backup.archive.gz"
+    # Restaura no runner, com a mesma versão-base e sem rede, portas ou volumes da aplicação.
+    image=$(awk '$1 == "FROM" { print $2; exit }' "$(dirname -- "${BASH_SOURCE[0]}")/../banco-de-dados/Dockerfile")
+    restore_container=$(docker run -d --network none --no-healthcheck \
+      --entrypoint mongod "$image" --bind_ip 127.0.0.1)
+    mongo_url='mongodb://127.0.0.1:27017/?serverSelectionTimeoutMS=2000'
+    timeout 90 bash -c '
+      until docker exec "$1" mongosh "$2" --quiet \
+          --eval "quit(db.adminCommand({ping: 1}).ok === 1 ? 0 : 1)" >/dev/null 2>&1; do
+        sleep 2
+      done
+    ' bash "$restore_container" "$mongo_url"
+    docker exec -i "$restore_container" mongorestore --archive --gzip --stopOnError < "$workdir/backup.archive.gz"
+    docker exec "$restore_container" mongosh "$mongo_url" --quiet --eval '
+      const todos = db.getSiblingDB("todo-app").todos;
+      const result = todos.validate();
+      if (!result.valid) quit(1);
+      print("Documentos recuperados: " + todos.countDocuments({}));
+    '
     echo "Restauração isolada concluída: $prefix/$name"
     ;;
   reset-list)
